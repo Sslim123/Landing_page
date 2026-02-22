@@ -1,31 +1,53 @@
 import dotenv from "dotenv";
 dotenv.config();
-console.log("DB_USER:", process.env.DB_USER);
-console.log("DB_PASSWORD:", process.env.DB_PASSWORD);
-
 import express from "express";
 import pkg from "pg";
 import crypto from "crypto";
 import cron from "node-cron";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import nodemailer from "nodemailer";
 import cors from "cors";
-
+import { body, validationResult } from "express-validator";
+import { fileURLToPath } from "url";
+import path from "path";
 const { Pool } = pkg;
 const app = express();
-
-/* ===================== CONFIG ===================== */
-
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.SERVER_PORT || 4000;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50
+});
+app.use("/apply", limiter);
+app.use("/verify", limiter);
 
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: Number(process.env.DB_PORT),
+  connectionString: process.env.DATABASE_URL,
+  // Only use SSL if we are NOT on localhost
+  ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
 });
-console.log("DB PASSWORD:", typeof process.env.DB_PASSWORD);
+/* ===================== CONFIG ===================== */
+app.use(cors({
+  origin: ["http://localhost:5173", "https://sslim123.github.io"],
+  methods: ["GET", "POST"],
+  credentials: true
+}));
+app.use(express.json());
+
+app.use(
+  helmet.contentSecurityPolicy({
+    directives: {
+      "default-src": ["'self'"],
+      "img-src": ["'self'", "data:", "https://res.cloudinary.com/dndvxb9hk/image/upload/v1770707447/nyala-academy-logo_tudtwu.png"], // Add Cloudinary here
+    },
+  })
+);
+app.use(express.static(path.join(__dirname, "../client/dist")));
+app.use(express.static(path.join(__dirname, "../client/public")));
+
+/* ===================== APPLY ENDPOINT ===================== */
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -34,34 +56,53 @@ const transporter = nodemailer.createTransport({
     pass: process.env.PASSWORD_USER, // Gmail App Password
   },
 });
+app.post("/api/apply-free-course",
+  body("email").isEmail(),
+  body("name").isLength({ min: 2 }),
 
-const FRONTEND_URL = "http://localhost";
-const PORT = 4000;
+  async (req, res) => {
+    console.log("📥 Request Received!", req.body); // ADD THIS LINE
 
-/* ===================== APPLY ENDPOINT ===================== */
-
-app.post("/api/apply-free-course", async (req, res) => {
-  try {
-    const { name, email } = req.body;
-
-    const result = await pool.query(
-      `
-      INSERT INTO users (name, email, access_token)
-      VALUES ($1, $2, gen_random_uuid())
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    try {
+      const { name, email } = req.body;
+      const result = await pool.query(
+        `
+      INSERT INTO users (name, email)
+      VALUES ($1, $2)
       ON CONFLICT (email)
-      DO UPDATE SET email = EXCLUDED.email
+     DO UPDATE SET name = EXCLUDED.name
       RETURNING id
       `,
-      [name, email]
-    );
+        [name, email]
+      );
+      const rawToken = crypto.randomBytes(32).toString("hex");
 
-    // 📧 إرسال الإيميل
-    await transporter.sendMail({
-      from: `"SEB Academy" <${process.env.GMAIL_USER}>`,
-      to: email,
+      const tokenHash = crypto
+        .createHash("sha256")
+        .update(rawToken)
+        .digest("hex");
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      await pool.query(
+        `UPDATE users 
+        SET access_token_hash = $1,
+        access_token_expires_at = $2
+        WHERE email = $3`,
+        [tokenHash, expiresAt, email]
+      );
+      try {
+        // 📧 إرسال الإيميل
 
-      // Example for your backend string
- html : `
+        const info = await transporter.sendMail({
+          from: `"Nyala Academy" <${process.env.GMAIL_USER}>`,
+          to: email,
+          subject: "تم استلام طلبك بنجاح - Nyala Academy",
+
+          // Example for your backend string
+          html: `
 <div dir="rtl" style="background-color: #f9f9f9; padding: 20px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: right;">
     <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border: 1px solid #eeeeee; border-radius: 8px; overflow: hidden;">
         <tr>
@@ -79,7 +120,7 @@ app.post("/api/apply-free-course", async (req, res) => {
 
                 <div style="background-color: #f0f7ff; border-right: 4px solid #1a73e8; padding: 20px; border-radius: 4px; margin-bottom: 25px;">
                     <p style="color: #2c3e50; font-size: 16px; margin: 0; line-height: 1.5;">
-                        📅 خلال <strong>7 أيام</strong> ستحصل على رسالة تحتوي على رابط الدخول للكورس.
+                        📅 خلال <strong> أيام</strong> ستحصل على رسالة تحتوي على رابط الدخول للكورس.
                     </p>
                 </div>
 
@@ -105,37 +146,41 @@ app.post("/api/apply-free-course", async (req, res) => {
     </table>
 </div>
 `
-    });
-
-
-    transporter.verify((error, success) => {
-      if (error) {
-        console.error("❌ Email config error:", error);
-      } else {
-        console.log("✅ Email server is ready", success);
+        })
+        console.log("📬 Email Sent ID:", info.messageId);
       }
-    });
-    res.json({ success: true });
-  } catch (err) {
-    console.error("SERVER ERROR:", err);
-    // تأكّد أننا لم نرسل ردًّا سابقًا
-    if (!res.headersSent) {
-      return res.status(500).json({ error: "server_error" });
+      catch (error) {
+        console.error("🔥 NODEMAILER ERROR:", error.message);
+        console.error("Error Code:", error.code); // Look for EAUTH or ETIMEDOUT
+      }
+
+
+      transporter.verify((error, success) => {
+        if (error) {
+          console.error("❌ Email config error:", error);
+        } else {
+          console.log("✅ Email server is ready", success);
+        }
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("SERVER ERROR:", err);
+      // تأكّد أننا لم نرسل ردًّا سابقًا
+      if (!res.headersSent) {
+        return res.status(500).json({ error: "server_error" });
+      }
     }
-  }
-});
-// TEMP: free course access email
+  });
+
 // TODO: move this logic to main platform backend
-// take student to main web site for access to free course 
 async function sendFreeCourseAccessEmail(user) {
   const link = `http://localhost:3000/free-course-entry?token=${user.access_token}`;
-
+  //https://yourdomain.com/verify?token=RAW_TOKEN
   await transporter.sendMail({
-    from: `"SEB Academy" <${process.env.GMAIL_USER}>`,
+    from: `"Nyala Academy" <${process.env.GMAIL_USER}>`,
     to: user.email,
     subject: "🎉 حان وقت بدء دورتك المجانية",
-    // This string is ready for your backend mailer (e.g., Nodemailer, SendGrid, Postmark)
-html: `
+    html: `
 <div dir="rtl" style="background-color: #f4f7f9; padding: 30px 10px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: right;">
     <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
         <tr>
@@ -188,8 +233,8 @@ html: `
     </table>
 </div>
 `
-   
-  
+
+
   });
 }
 
@@ -198,27 +243,35 @@ html: `
 cron.schedule("*/1 * * * *", async () => {
   console.log("⏰ Checking users for free course email...");
 
-  const waitDays = process.env.COURSE_WAIT_DAYS || 7;
+  const waitDays = parseInt(process.env.COURSE_WAIT_DAYS) || 7;
 
-  const result = await pool.query(`
-    SELECT * FROM users
-    WHERE free_course_email_sent = false
-    AND applied_at <= NOW() - INTERVAL '${waitDays} days'
-  `);
+  const result = await pool.query(
+    `
+  SELECT *
+  FROM users
+  WHERE email_sent_at IS NULL
+  AND applied_at <= NOW() - ($1 || ' days')::interval
+  `
+    ,
+    [waitDays]
+
+  );
 
   for (const user of result.rows) {
     try {
       await sendFreeCourseAccessEmail(user);
 
       await pool.query(
-        `UPDATE users
-         SET free_course_email_sent = true,
-             free_access_enabled = true
-         WHERE id = $1`,
+        `
+         UPDATE users
+  SET email_sent_at = NOW(),
+      free_access_enabled = true
+  WHERE id = $1
+
+         `,
         [user.id]
       );
 
-      console.log(`✅ Free course email sent to ${user.email}`);
     } catch (err) {
       console.error("❌ Email send failed:", err);
     }
@@ -228,24 +281,72 @@ cron.schedule("*/1 * * * *", async () => {
 /* ===================== FREE COURSE ACCESS CHECK ===================== */
 
 app.get("/api/verify-free-access", async (req, res) => {
-  const { token } = req.query;
+  try {
+    const { token } = req.query;
 
-  const { rows } = await pool.query(
-    "SELECT * FROM users WHERE access_token = $1",
-    [token]
-  );
+    if (!token) {
+      return res.status(400).json({ access: false, message: "No token provided" });
+    }
 
-  if (!rows.length || !rows[0].free_access_enabled) {
-    return res.status(403).json({ access: false });
+    const hash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const { rows } = await pool.query(
+      `
+      SELECT id, name 
+      FROM users
+      WHERE access_token_hash = $1
+      AND access_token_expires_at > NOW()
+      `,
+      [hash]
+    );
+
+    const user = rows[0];
+
+    if (!user) {
+      return res.status(403).json({
+        access: false,
+        message: "Invalid or expired token."
+      });
+    }
+
+    // ✅ Enable access and clear token
+    await pool.query(
+      `
+      UPDATE users
+      SET free_access_enabled = TRUE,
+          access_token_hash = NULL,
+          access_token_expires_at = NULL
+      WHERE id = $1
+      `,
+      [user.id]
+    );
+
+    res.json({
+      access: true,
+      user: user.name
+    });
+
+  } catch (error) {
+    console.error("Verification Error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  res.json({ access: true, user: rows[0].name });
 });
+app.use(express.static(path.join(__dirname, "../client/dist")));
 
-
-
+/* 3. The Catch-All: Only runs if the request didn't match an API or Static file */
+app.get("/{*any}", (req, res) => {
+  // If it's an API call that doesn't exist, don't send the HTML, send a 404
+  if (req.originalUrl.startsWith('/api')) {
+    return res.status(404).json({ error: "API endpoint not found" });
+  }
+  // Otherwise, send the frontend app
+  res.sendFile(path.join(__dirname, "../client/dist", "index.html"));
+});
 /* ===================== START SERVER ===================== */
+app.listen(PORT, '0.0.0.0', () => {
 
-app.listen(PORT, () => {
   console.log(`🚀 SEB Backend running on port ${PORT}`);
 });
