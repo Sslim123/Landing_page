@@ -15,7 +15,7 @@ const ApplyForm = () => {
     try {
       // --Apply for free course 
       const response = await fetch(
-        "http://localhost:4000/api/apply-free-course",
+        `/api/apply-free-course`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
