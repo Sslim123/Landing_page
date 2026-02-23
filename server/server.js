@@ -14,39 +14,83 @@ import path from "path";
 const { Pool } = pkg;
 const app = express();
 const PORT = process.env.SERVER_PORT || 4000;
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+//const __filename = fileURLToPath(import.meta.url);
+//const __dirname = path.dirname(__filename);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 50
 });
+dotenv.config({ path: path.join(__dirname, "../.env") });
 app.use("/apply", limiter);
 app.use("/verify", limiter);
 
+// const connectionString = process.env.DATABASE_URL;
+
+// if (!connectionString) {
+//   console.error("❌ CRITICAL ERROR: DATABASE_URL is not defined in Environment Variables!");
+// }
+
+// const pool = new Pool({
+//   connectionString: connectionString,
+//   ssl: connectionString && connectionString.includes("localhost")
+//     ? false
+//     : { rejectUnauthorized: false }
+// });
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Only use SSL if we are NOT on localhost
-  ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+  // Use port 6543 in your DATABASE_URL for pooling!
+  ssl: process.env.DATABASE_URL.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false }
 });
 /* ===================== CONFIG ===================== */
 app.use(cors({
-  origin: ["http://localhost:5173", "https://sslim123.github.io"],
+  origin: ["http://localhost:5173",
+    "https://nyala-academy-live.onrender.com"], // YOUR NEW RENDER URL],
   methods: ["GET", "POST"],
   credentials: true
 }));
 app.use(express.json());
-
 app.use(
   helmet.contentSecurityPolicy({
     directives: {
-      "default-src": ["'self'"],
-      "img-src": ["'self'", "data:", "https://res.cloudinary.com/dndvxb9hk/image/upload/v1770707447/nyala-academy-logo_tudtwu.png"], // Add Cloudinary here
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      connectSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https://res.cloudinary.com"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
     },
   })
 );
 app.use(express.static(path.join(__dirname, "../client/dist")));
 app.use(express.static(path.join(__dirname, "../client/public")));
+/* ===================== HEALTH CHECK ===================== */
+app.get("/api/health", async (req, res) => {
+  try {
+    // 1. Check Database Variable
+    const dbCheck = await pool.query("SELECT NOW()");
 
+    // 2. Check Environment Variables (Do NOT leak passwords!)
+    const envCheck = {
+      nodeEnv: process.env.NODE_ENV,
+      port: process.env.SERVER_PORT || process.env.PORT,
+      dbConnected: !!dbCheck.rows[0],
+    };
+
+    res.json({
+      status: "✅ Server is healthy",
+      timestamp: dbCheck.rows[0].now,
+      details: envCheck
+    });
+  } catch (err) {
+    console.error("Health Check Failed:", err.message);
+    res.status(500).json({
+      status: "❌ Server Unhealthy",
+      error: err.message
+    });
+  }
+});
 /* ===================== APPLY ENDPOINT ===================== */
 
 const transporter = nodemailer.createTransport({
